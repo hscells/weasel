@@ -22,14 +22,15 @@ var punctuationRegex *regexp.Regexp = regexp.MustCompile("[.,#!$?%^&*;:{}+|\\<>=
 // spaceRegex finds multiple spaces
 var spaceRegex *regexp.Regexp = regexp.MustCompile("[ \n\r]+")
 
-// Number of documents to bulk index before dumping
+// Number of documents to bulk index before dumping. It seems like it's fairly okay to keep this number high
 var dumpNum int64 = 50000
 
+// IndexedDocument is a document that gets returned if the index is asked for a document
 type IndexedDocument struct {
 	Source map[string]interface{}
 }
 
-// InvertedIndex stores our document mapping
+// InvertedIndex stores statistics and indexes the documents
 type InvertedIndex struct {
 	// Name of the index
 	Name            string
@@ -157,6 +158,8 @@ func (i *InvertedIndex) Index(d document.Document) error {
 	return nil
 }
 
+// BulkIndex will index a whole list of documents at once. This is the preferred way of indexing, since as a side
+// effect, this function will dump the documents to disk at regular intervals.
 func (i *InvertedIndex) BulkIndex(docs []document.Document) error {
 	for idx, d := range docs {
 		err := i.Index(d)
@@ -164,7 +167,7 @@ func (i *InvertedIndex) BulkIndex(docs []document.Document) error {
 			return err
 		}
 
-		if int64(idx) % dumpNum == 0 {
+		if int64(idx + 1) % dumpNum == 0 {
 			err := i.DumpDocs()
 			if err != nil {
 				return err
@@ -178,14 +181,13 @@ func (i *InvertedIndex) BulkIndex(docs []document.Document) error {
 	return nil
 }
 
-// Get is a function that returns the source of a single document in the index
+// Get is a function that returns the source of a single document in the index.
 func (i *InvertedIndex) Get(docId int64) (map[string]interface{}, error) {
 	if v, ok := i.documents[docId]; ok {
 		return v.Source, nil
 	} else if v, ok := i.cachedDocuments[docId]; ok {
 		return v.Source, nil
 	} else {
-		// TODO this can be parallelised
 		// Try to read all the dumped files, searching for the doc
 		for _, docFile := range i.DocumentFiles {
 			data, err := ioutil.ReadFile(i.createDumpDocsName(docFile))
@@ -210,11 +212,12 @@ func (i *InvertedIndex) Get(docId int64) (map[string]interface{}, error) {
 	return make(map[string]interface{}), errors.New(fmt.Sprintf("Document with id %v does not exist.", docId))
 }
 
+// createDumpDocsName is a helper function for creating names of files to dump
 func (i *InvertedIndex) createDumpDocsName(docId int64) string {
 	return i.Name + "/" + strconv.FormatInt(docId, 10) + ".wdocs"
 }
 
-// Dump an index to file
+// Dump an index to file. This is a one-to-one in-memory dump of the inverted index, plus the statistics.
 func (i *InvertedIndex) Dump() error {
 	var buff bytes.Buffer
 	enc := gob.NewEncoder(&buff)
@@ -227,7 +230,15 @@ func (i *InvertedIndex) Dump() error {
 	return ioutil.WriteFile(i.Name + ".weasel", buff.Bytes(), 0664)
 }
 
+// DumpDocs dumps the documents inside the inverted index at any given time and dumps them to a file. The resulting file
+// contains a one-to-one mapping of a slice of Documents ([]IndexedDocument)
 func (i *InvertedIndex) DumpDocs() error {
+	// Leave this function if there is nothing to do
+	if len(i.DocumentFiles) > 0 && i.NumDocs == i.DocumentFiles[len(i.DocumentFiles) - 1] {
+		return nil
+	}
+
+	// Create the folder for documents in the index if if doesn't exist
 	if _, err := os.Stat(i.Name + "/"); os.IsNotExist(err) {
 		err := os.Mkdir(i.Name + "/", 0777)
 		if err != nil {
@@ -235,6 +246,7 @@ func (i *InvertedIndex) DumpDocs() error {
 		}
 	}
 
+	// Dump the documents in memory to disk and clear the documents in memory
 	var buff bytes.Buffer
 	enc := gob.NewEncoder(&buff)
 
@@ -251,7 +263,7 @@ func (i *InvertedIndex) DumpDocs() error {
 	return ioutil.WriteFile(docName, buff.Bytes(), 0664)
 }
 
-// Load an index from a file
+// Load an index from a file.
 func Load(filename string) (InvertedIndex, error) {
 	data, err := ioutil.ReadFile(filename)
 	if err != nil {

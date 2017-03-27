@@ -26,6 +26,8 @@ var And booleanOperator = booleanOperator{name: "and"}
 var Or booleanOperator = booleanOperator{name: "or"}
 var Not booleanOperator = booleanOperator{name: "not"}
 
+// BooleanQuery is the representation of a boolean query in prefix notation -> (AND term term (OR term term)). This is
+// an easy query to parse and nesting is easy to calculate.
 type BooleanQuery struct {
 	Operator   booleanOperator
 	Field      string
@@ -33,7 +35,8 @@ type BooleanQuery struct {
 	Children   []BooleanQuery
 }
 
-// Query is an implementation of a boolean query
+// Query is an implementation of a boolean query.
+//
 // TODO nested boolean queries don't work as expected and need fixing, NOT also needs implementing, but POC is there
 func (b *BooleanQuery) Query(i index.InvertedIndex) []RetrievedDocument {
 	docs := make([]RetrievedDocument, 0)
