@@ -12,6 +12,8 @@ import (
 	"bytes"
 	"log"
 	"io/ioutil"
+	"strconv"
+	"os"
 )
 
 // punctuationRegex is the regex used to remove punctuation from fields in documents submitted to the index
@@ -20,10 +22,20 @@ var punctuationRegex *regexp.Regexp = regexp.MustCompile("[.,#!$?%^&*;:{}+|\\<>=
 // spaceRegex finds multiple spaces
 var spaceRegex *regexp.Regexp = regexp.MustCompile("[ \n\r]+")
 
+// Number of documents to bulk index before dumping
+var dumpNum int64 = 50000
+
+type IndexedDocument struct {
+	Source map[string]interface{}
+}
+
 // InvertedIndex stores our document mapping
 type InvertedIndex struct {
 	// Name of the index
 	Name            string
+
+	// Number of documents in the index
+	NumDocs         int64
 
 	// Ensure each field is the correct type
 	// field->(type)
@@ -33,13 +45,23 @@ type InvertedIndex struct {
 	// field->termId->docId
 	InvertedIndex   map[string]map[int64][]int64
 
-	// mapping of terms to the index in the term vector
+	// Mapping of terms to the index in the term vector
 	// term->position
 	TermMapping     map[string]int64
 
-	// Documents added to the index
+	// Term frequency (number of terms)
+	// termId->TF
+	TermFrequency   map[int64]int64
+
+	// Documents added to the index. This is volatile and should not be considered as the full collection.
 	// docId->[]docSource
-	Documents       map[int64]map[string]interface{}
+	documents       map[int64]IndexedDocument
+
+	// Documents which are cached in memory and have already been indexed
+	cachedDocuments map[int64]IndexedDocument
+
+	// Filenames documents are stored in
+	DocumentFiles   []int64
 }
 
 // New is the constructor for the InvertedIndex. It takes a document mapping.
@@ -49,7 +71,9 @@ func New(name string, mapping map[string]reflect.Kind) InvertedIndex {
 		InvertedIndex: make(map[string]map[int64][]int64),
 		DocumentMapping: mapping,
 		TermMapping: make(map[string]int64),
-		Documents: make(map[int64]map[string]interface{}),
+		TermFrequency: make(map[int64]int64),
+		documents: make(map[int64]IndexedDocument),
+		cachedDocuments: make(map[int64]IndexedDocument),
 	}
 }
 
@@ -88,7 +112,7 @@ func (i *InvertedIndex) Index(d document.Document) error {
 		return errors.New("Field count mismatch.")
 	}
 
-	docId := int64(len(i.Documents))
+	docId := i.NumDocs
 
 	// check the types of the mapping match that of the source
 	for k := range d.Source() {
@@ -100,12 +124,21 @@ func (i *InvertedIndex) Index(d document.Document) error {
 			return errors.New(fmt.Sprintf("Incorrect type for %v. Expecting %v, got %v.", k, dType, vType))
 		}
 
-		// add new terms to the term mapping
+		// Add new terms to the term mapping
 		terms := extractTerms(v)
 		for _, t := range terms {
+			// Create a position of the term in the posting if one does not exist
 			if _, ok := i.TermMapping[t]; !ok {
 				i.TermMapping[t] = int64(len(i.TermMapping))
 			}
+
+			// Recalculate term frequency
+			if _, ok := i.TermFrequency[i.TermMapping[t]]; ok {
+				i.TermFrequency[i.TermMapping[t]]++
+			} else {
+				i.TermFrequency[i.TermMapping[t]] = 1
+			}
+
 		}
 
 		// add the document to the inverted index
@@ -118,14 +151,67 @@ func (i *InvertedIndex) Index(d document.Document) error {
 	}
 
 	d.Set("id", docId)
-	i.Documents[docId] = d.Source()
+	i.documents[docId] = IndexedDocument{Source: d.Source()}
+	i.NumDocs++
 
 	return nil
 }
 
+func (i *InvertedIndex) BulkIndex(docs []document.Document) error {
+	for idx, d := range docs {
+		err := i.Index(d)
+		if err != nil {
+			return err
+		}
+
+		if int64(idx) % dumpNum == 0 {
+			err := i.DumpDocs()
+			if err != nil {
+				return err
+			}
+		}
+	}
+	err := i.DumpDocs()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 // Get is a function that returns the source of a single document in the index
-func (i *InvertedIndex) Get(docId int64) map[string]interface{} {
-	return i.Documents[docId]
+func (i *InvertedIndex) Get(docId int64) (map[string]interface{}, error) {
+	if v, ok := i.documents[docId]; ok {
+		return v.Source, nil
+	} else if v, ok := i.cachedDocuments[docId]; ok {
+		return v.Source, nil
+	} else {
+		// TODO this can be parallelised
+		// Try to read all the dumped files, searching for the doc
+		for _, docFile := range i.DocumentFiles {
+			data, err := ioutil.ReadFile(i.createDumpDocsName(docFile))
+			if err != nil {
+				return make(map[string]interface{}), err
+			}
+
+			dec := gob.NewDecoder(bytes.NewReader(data))
+			var indexedDocs map[int64]IndexedDocument
+			err = dec.Decode(&indexedDocs)
+			if err != nil {
+				return make(map[string]interface{}), err
+			}
+
+			if v, ok := indexedDocs[docId]; ok {
+				i.cachedDocuments = indexedDocs
+				return v.Source, nil
+			}
+		}
+	}
+
+	return make(map[string]interface{}), errors.New(fmt.Sprintf("Document with id %v does not exist.", docId))
+}
+
+func (i *InvertedIndex) createDumpDocsName(docId int64) string {
+	return i.Name + "/" + strconv.FormatInt(docId, 10) + ".wdocs"
 }
 
 // Dump an index to file
@@ -138,7 +224,31 @@ func (i *InvertedIndex) Dump() error {
 		log.Panicln(err)
 	}
 
-	return ioutil.WriteFile(i.Name + ".weasle", buff.Bytes(), 0664)
+	return ioutil.WriteFile(i.Name + ".weasel", buff.Bytes(), 0664)
+}
+
+func (i *InvertedIndex) DumpDocs() error {
+	if _, err := os.Stat(i.Name + "/"); os.IsNotExist(err) {
+		err := os.Mkdir(i.Name + "/", 0777)
+		if err != nil {
+			return err
+		}
+	}
+
+	var buff bytes.Buffer
+	enc := gob.NewEncoder(&buff)
+
+	err := enc.Encode(i.documents)
+	if err != nil {
+		log.Panicln(err)
+	}
+
+	i.documents = make(map[int64]IndexedDocument)
+
+	i.DocumentFiles = append(i.DocumentFiles, i.NumDocs)
+	docName := i.createDumpDocsName(i.NumDocs)
+
+	return ioutil.WriteFile(docName, buff.Bytes(), 0664)
 }
 
 // Load an index from a file

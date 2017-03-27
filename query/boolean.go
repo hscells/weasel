@@ -2,8 +2,21 @@ package query
 
 import (
 	"github.com/hscells/weasel/index"
-	"github.com/hscells/weasel/document"
+	"log"
+	"sort"
 )
+
+type int64arr []int64
+
+func (a int64arr) Len() int {
+	return len(a)
+}
+func (a int64arr) Swap(i, j int) {
+	a[i], a[j] = a[j], a[i]
+}
+func (a int64arr) Less(i, j int) bool {
+	return a[i] < a[j]
+}
 
 type booleanOperator struct {
 	name string
@@ -22,18 +35,22 @@ type BooleanQuery struct {
 
 // Query is an implementation of a boolean query
 // TODO nested boolean queries don't work as expected and need fixing, NOT also needs implementing, but POC is there
-func (b *BooleanQuery) Query(i index.InvertedIndex) []document.Document {
-	docs := make([]document.Document, 0)
+func (b *BooleanQuery) Query(i index.InvertedIndex) []RetrievedDocument {
+	docs := make([]RetrievedDocument, 0)
 
 	if b.Operator == Or {
 		// Handle the OR case
 
 		// docId->docSource
-		d := make(map[int64]document.Document)
+		d := make(map[int64]RetrievedDocument)
 		for _, t := range b.QueryTerms {
 			docIds := i.InvertedIndex[b.Field][i.TermMapping[t]]
 			for _, docId := range docIds {
-				d[docId] = document.From(i.Documents[docId])
+				source, err := i.Get(docId)
+				if err != nil {
+
+				}
+				d[docId] = NewRetrievedDocument(source)
 			}
 		}
 
@@ -57,11 +74,28 @@ func (b *BooleanQuery) Query(i index.InvertedIndex) []document.Document {
 			}
 		}
 
-		// Now group the docs
+		log.Println("got list of docs")
+
+		// Get a list of doc ids
+		var docIds int64arr
 		for k, v := range d {
 			if v == len(b.QueryTerms) {
-				docs = append(docs, document.From(i.Documents[k]))
+				docIds = append(docIds, k)
 			}
+		}
+
+		log.Println("sorting docs")
+
+		// now get the docs
+		sort.Sort(docIds)
+
+		log.Println("actually getting documents now")
+		for _, k := range docIds {
+			v, err := i.Get(k)
+			if err != nil {
+
+			}
+			docs = append(docs, NewRetrievedDocument(v))
 		}
 	}
 
