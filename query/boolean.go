@@ -25,9 +25,26 @@ type BooleanQuery struct {
 // intersect is a fast set intersection function that operates on multiple vectors and sorts the results.
 func intersect(vecs [][]int64) []int64 {
 	vecLen := len(vecs)
-	docIds := distinct(vecs)
+	// docId->queryId->(present)
+	queryIds := make(map[int64]map[int]bool)
+	// docId->count(queryId)
+	docIds := make(map[int64]int)
+	for i, j := range vecs {
+		for _, v := range j {
+			// Create the new map if it doesn't exist
+			if _, ok := queryIds[v]; !ok {
+				queryIds[v] = make(map[int]bool)
+				docIds[v] = 0
+			}
 
-	log.Println(vecLen)
+			// If the docId for the queryTerm hasn't been seen, set it in the map and increase the docId
+			if _, ok := queryIds[v][i]; !ok {
+				queryIds[v][i] = true
+			} else {
+				docIds[v]++
+			}
+		}
+	}
 
 	docIdsIntersection := make([]int64, 0)
 	for k, v := range docIds {
@@ -41,13 +58,14 @@ func intersect(vecs [][]int64) []int64 {
 // distinct is a fast set distinct function that operates on multiple vectors at once.
 func distinct(vecs [][]int64) map[int64]int {
 	docIds := make(map[int64]int)
-	for _, i := range vecs {
-		for _, v := range i {
+	for i, j := range vecs {
+		for _, v := range j {
 			if _, ok := docIds[v]; ok {
 				docIds[v]++
 			} else {
 				docIds[v] = 1
 			}
+			log.Println(i, v, docIds[v])
 		}
 	}
 	return docIds
