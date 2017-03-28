@@ -1,3 +1,4 @@
+// Package query contains functions and structures relating to the query DSL.
 package query
 
 import (

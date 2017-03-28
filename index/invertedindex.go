@@ -1,4 +1,4 @@
-// package index implements an inverted index used to store documents from package document.
+// Package index implements an inverted index used to store documents from package document.
 package index
 
 import (
@@ -14,7 +14,20 @@ import (
 	"io/ioutil"
 	"strconv"
 	"os"
+	"sort"
 )
+
+type int64arr []int64
+
+func (a int64arr) Len() int {
+	return len(a)
+}
+func (a int64arr) Swap(i, j int) {
+	a[i], a[j] = a[j], a[i]
+}
+func (a int64arr) Less(i, j int) bool {
+	return a[i] < a[j]
+}
 
 // punctuationRegex is the regex used to remove punctuation from fields in documents submitted to the index
 var punctuationRegex *regexp.Regexp = regexp.MustCompile("[.,#!$?%^&*;:{}+|\\<>=_`~()/-]")
@@ -28,6 +41,7 @@ var dumpNum int64 = 50000
 // IndexedDocument is a document that gets returned if the index is asked for a document
 type IndexedDocument struct {
 	Source map[string]interface{}
+	Rank   int64
 }
 
 // InvertedIndex stores statistics and indexes the documents
@@ -143,16 +157,16 @@ func (i *InvertedIndex) Index(d document.Document) error {
 		}
 
 		// add the document to the inverted index
-		for _, j := range termVector(terms, i.TermMapping) {
+		for _, p := range termVector(terms, i.TermMapping) {
 			if _, ok := i.InvertedIndex[k]; !ok {
 				i.InvertedIndex[k] = make(map[int64][]int64)
 			}
-			i.InvertedIndex[k][j] = append(i.InvertedIndex[k][j], docId)
+			i.InvertedIndex[k][p] = append(i.InvertedIndex[k][p], docId)
 		}
 	}
 
-	d.Set("id", docId)
 	i.documents[docId] = IndexedDocument{Source: d.Source()}
+	i.documents[docId].Source["id"] = docId
 	i.NumDocs++
 
 	return nil
@@ -190,26 +204,41 @@ func (i *InvertedIndex) Get(docId int64) (map[string]interface{}, error) {
 	} else {
 		// Try to read all the dumped files, searching for the doc
 		for _, docFile := range i.DocumentFiles {
-			data, err := ioutil.ReadFile(i.createDumpDocsName(docFile))
-			if err != nil {
-				return make(map[string]interface{}), err
-			}
+			if docId <= docFile {
+				data, err := ioutil.ReadFile(i.createDumpDocsName(docFile))
+				if err != nil {
+					return make(map[string]interface{}), err
+				}
 
-			dec := gob.NewDecoder(bytes.NewReader(data))
-			var indexedDocs map[int64]IndexedDocument
-			err = dec.Decode(&indexedDocs)
-			if err != nil {
-				return make(map[string]interface{}), err
-			}
+				dec := gob.NewDecoder(bytes.NewReader(data))
+				var indexedDocs map[int64]IndexedDocument
+				err = dec.Decode(&indexedDocs)
+				if err != nil {
+					return make(map[string]interface{}), err
+				}
 
-			if v, ok := indexedDocs[docId]; ok {
-				i.cachedDocuments = indexedDocs
-				return v.Source, nil
+				if v, ok := indexedDocs[docId]; ok {
+					i.cachedDocuments = indexedDocs
+					return v.Source, nil
+				}
 			}
 		}
 	}
 
 	return make(map[string]interface{}), errors.New(fmt.Sprintf("Document with id %v does not exist.", docId))
+}
+
+func (i *InvertedIndex) GetSources(docIds int64arr) ([]IndexedDocument, error) {
+	sort.Sort(docIds)
+	docs := make([]IndexedDocument, len(docIds))
+	for j, k := range docIds {
+		d, err := i.Get(k)
+		if err != nil {
+			return make([]IndexedDocument, 0), err
+		}
+		docs[j] = IndexedDocument{Source: d}
+	}
+	return docs, nil
 }
 
 // createDumpDocsName is a helper function for creating names of files to dump
@@ -255,7 +284,7 @@ func (i *InvertedIndex) DumpDocs() error {
 		log.Panicln(err)
 	}
 
-	i.documents = make(map[int64]IndexedDocument)
+	i.documents = make(map[int64]IndexedDocument, 0)
 
 	i.DocumentFiles = append(i.DocumentFiles, i.NumDocs)
 	docName := i.createDumpDocsName(i.NumDocs)

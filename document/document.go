@@ -9,7 +9,7 @@ import (
 
 // Document is a container for a document
 type Document struct {
-	id     int64
+	id     interface{}
 	source map[string]interface{}
 }
 
@@ -24,7 +24,11 @@ func New() Document {
 func From(source map[string]interface{}) Document {
 	d := New()
 	for k, v := range source {
-		d.Set(k, v)
+		if k == "id" {
+			d.id = v
+		} else {
+			d.Set(k, v)
+		}
 	}
 	return d
 }
@@ -53,6 +57,10 @@ func (d *Document) Set(field string, value interface{}) error {
 
 // Get a single field from the document
 func (d *Document) Get(field string) interface{} {
+	// The id may be specified manually
+	if field == "id" {
+		return d.id
+	}
 	return d.source[field]
 }
 
