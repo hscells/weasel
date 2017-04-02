@@ -2,7 +2,6 @@ package query
 
 import (
 	"github.com/hscells/weasel/index"
-	"log"
 )
 
 type booleanOperator struct {
@@ -26,26 +25,28 @@ type BooleanQuery struct {
 func intersect(vecs [][]int64) []int64 {
 	vecLen := len(vecs)
 	// docId->queryId->(present)
-	queryIds := make(map[int64]map[int]bool)
+	queryIds := make(map[int]map[int64]bool)
 	// docId->count(queryId)
 	docIds := make(map[int64]int)
+
+	// This loop is the intersect algorithm
 	for i, j := range vecs {
 		for _, v := range j {
 			// Create the new map if it doesn't exist
-			if _, ok := queryIds[v]; !ok {
-				queryIds[v] = make(map[int]bool)
+			if _, ok := queryIds[i]; !ok {
+				queryIds[i] = make(map[int64]bool)
 				docIds[v] = 0
 			}
 
 			// If the docId for the queryTerm hasn't been seen, set it in the map and increase the docId
-			if _, ok := queryIds[v][i]; !ok {
-				queryIds[v][i] = true
-			} else {
+			if _, ok := queryIds[i][v]; !ok {
+				queryIds[i][v] = true
 				docIds[v]++
 			}
 		}
 	}
 
+	// Collect the doc ids that were intersected by the query terms
 	docIdsIntersection := make([]int64, 0)
 	for k, v := range docIds {
 		if v == vecLen {
@@ -56,18 +57,26 @@ func intersect(vecs [][]int64) []int64 {
 }
 
 // distinct is a fast set distinct function that operates on multiple vectors at once.
-func distinct(vecs [][]int64) map[int64]int {
-	docIds := make(map[int64]int)
-	for i, j := range vecs {
+func distinct(vecs [][]int64) []int64 {
+	docIdCount := make(map[int64]int)
+	for _, j := range vecs {
 		for _, v := range j {
-			if _, ok := docIds[v]; ok {
-				docIds[v]++
+			if _, ok := docIdCount[v]; ok {
+				docIdCount[v]++
 			} else {
-				docIds[v] = 1
+				docIdCount[v] = 1
 			}
-			log.Println(i, v, docIds[v])
 		}
 	}
+
+	numTerms := len(vecs)
+	docIds := make([]int64, 0)
+	for k, v := range docIdCount {
+		if v == numTerms {
+			docIds = append(docIds, k)
+		}
+	}
+
 	return docIds
 }
 
@@ -84,10 +93,7 @@ func (b *BooleanQuery) Query(i index.InvertedIndex) ([]int64, error) {
 	// Secondly, filter based on operator
 	if b.Operator == Or {
 		// OR only requires a distinct set of documents
-		distinctDocIds := distinct(docIds)
-		for k := range distinctDocIds {
-			docs = append(docs, k)
-		}
+		docs = append(docs, distinct(docIds)...)
 
 		if len(b.Children) > 0 {
 			// Recursively walk the tree to query the rest of the set
