@@ -5,9 +5,9 @@ import (
 	"github.com/hscells/weasel/document"
 	"github.com/pkg/errors"
 	"reflect"
+	"golang.org/x/text/transform"
+	"golang.org/x/text/unicode/norm"
 	"fmt"
-	"strings"
-	"regexp"
 	"encoding/gob"
 	"bytes"
 	"log"
@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"os"
 	"sort"
+	"unicode"
 )
 
 type int64arr []int64
@@ -29,19 +30,20 @@ func (a int64arr) Less(i, j int) bool {
 	return a[i] < a[j]
 }
 
-// punctuationRegex is the regex used to remove punctuation from fields in documents submitted to the index
-var punctuationRegex *regexp.Regexp = regexp.MustCompile("[.,#!$?%^&*;:{}+|\\<>=_`~()/-]")
-
-// spaceRegex finds multiple spaces
-var spaceRegex *regexp.Regexp = regexp.MustCompile("[ \n\r]+")
-
 // Number of documents to bulk index before dumping. It seems like it's fairly okay to keep this number high
 var dumpNum int64 = 50000
 
 // IndexedDocument is a document that gets returned if the index is asked for a document
 type IndexedDocument struct {
-	Source map[string]interface{}
-	Rank   int64
+	Id            int64
+	Source        map[string]interface{}
+	TermFrequency map[string]map[int64]int64
+	Rank          int64
+}
+
+type TermStatistics struct {
+	TotalTermFrequency int64
+	DocumentFrequency  int64
 }
 
 // InvertedIndex stores statistics and indexes the documents
@@ -56,17 +58,17 @@ type InvertedIndex struct {
 	// field->(type)
 	DocumentMapping map[string]reflect.Kind
 
-	// Mapping is a map of term id to document id
+	// Posting is a map of term id to document id
 	// field->termId->docId
-	InvertedIndex   map[string]map[int64][]int64
+	Posting         map[string]map[int64][]int64
 
 	// Mapping of terms to the index in the term vector
 	// term->position
 	TermMapping     map[string]int64
 
-	// Term frequency (number of terms)
-	// termId->TF
-	TermFrequency   map[int64]int64
+	// Term statistics
+	// termId->TermStatistics
+	TermStatistics  map[int64]TermStatistics
 
 	// Documents added to the index. This is volatile and should not be considered as the full collection.
 	// docId->[]docSource
@@ -83,10 +85,10 @@ type InvertedIndex struct {
 func New(name string, mapping map[string]reflect.Kind) InvertedIndex {
 	return InvertedIndex{
 		Name: name,
-		InvertedIndex: make(map[string]map[int64][]int64),
+		Posting: make(map[string]map[int64][]int64),
 		DocumentMapping: mapping,
 		TermMapping: make(map[string]int64),
-		TermFrequency: make(map[int64]int64),
+		TermStatistics: make(map[int64]TermStatistics),
 		documents: make(map[int64]IndexedDocument),
 		cachedDocuments: make(map[int64]IndexedDocument),
 	}
@@ -106,14 +108,32 @@ func termVector(terms []string, mapping map[string]int64) []int64 {
 	return vec
 }
 
+func isMn(r rune) bool {
+	return unicode.Is(unicode.Mn, r) // Mn: nonspacing marks
+}
+
 // extractTerms normalises and splits fields into a slice of strings
 func extractTerms(value interface{}) []string {
 	switch v := value.(type) {
 	case string :{
-		s := strings.ToLower(v)
-		s = punctuationRegex.ReplaceAllString(s, "")
-		s = spaceRegex.ReplaceAllString(s, " ")
-		return strings.Split(s, " ")
+		textLength := len(v)
+
+		if textLength == 0 {
+			return []string{}
+		}
+
+		tokens := make([]string, 0)
+		var token string
+
+		for _, char := range v {
+			if !unicode.IsPunct(char) && !unicode.IsControl(char) && !unicode.IsSpace(char) {
+				token += string(unicode.ToLower(char))
+			} else if unicode.IsSpace(char) {
+				tokens = append(tokens, token)
+				token = ""
+			}
+		}
+		return tokens
 	}
 	case int, int64, float32, float64:
 	}
@@ -127,46 +147,69 @@ func (i *InvertedIndex) Index(d document.Document) error {
 		return errors.New("Field count mismatch.")
 	}
 
-	docId := i.NumDocs
+	termFrequency := make(map[string]map[int64]int64)
 
+	t := transform.Chain(norm.NFD, transform.RemoveFunc(isMn), norm.NFC)
+
+	docId := i.NumDocs
 	// check the types of the mapping match that of the source
 	for k := range d.Source() {
+		termFrequency[k] = make(map[int64]int64)
+
 		// type-check the document to the mapping in the index
 		dType := i.DocumentMapping[k]
+
 		v := d.Source()[k]
 		vType := reflect.TypeOf(v).Kind()
 		if !(vType == dType) {
 			return errors.New(fmt.Sprintf("Incorrect type for %v. Expecting %v, got %v.", k, dType, vType))
 		}
 
+		if vType == reflect.String {
+			v, _, _ = transform.String(t, d.Source()[k].(string))
+		}
+
 		// Add new terms to the term mapping
 		terms := extractTerms(v)
+		distinctTerms := make(map[int64]bool)
 		for _, t := range terms {
 			// Create a position of the term in the posting if one does not exist
 			if _, ok := i.TermMapping[t]; !ok {
 				i.TermMapping[t] = int64(len(i.TermMapping))
 			}
 
-			// Recalculate term frequency
-			if _, ok := i.TermFrequency[i.TermMapping[t]]; ok {
-				i.TermFrequency[i.TermMapping[t]]++
-			} else {
-				i.TermFrequency[i.TermMapping[t]] = 1
-			}
+			termId := i.TermMapping[t]
 
+			// Recalculate term frequency
+			if _, ok := i.TermStatistics[termId]; ok {
+				tmp := i.TermStatistics[termId]
+				tmp.TotalTermFrequency++
+				if _, ok := distinctTerms[termId]; !ok {
+					tmp.DocumentFrequency++
+					distinctTerms[termId] = true
+				}
+				i.TermStatistics[termId] = tmp
+			} else {
+				// Create a new term statistics object if one hasn't been created yet.
+				i.TermStatistics[termId] = TermStatistics{
+					TotalTermFrequency: 1,
+					DocumentFrequency: 1,
+				}
+			}
 		}
 
 		// add the document to the inverted index
 		for _, p := range termVector(terms, i.TermMapping) {
-			if _, ok := i.InvertedIndex[k]; !ok {
-				i.InvertedIndex[k] = make(map[int64][]int64)
+			if _, ok := i.Posting[k]; !ok {
+				i.Posting[k] = make(map[int64][]int64)
 			}
-			i.InvertedIndex[k][p] = append(i.InvertedIndex[k][p], docId)
+			i.Posting[k][p] = append(i.Posting[k][p], docId)
+			termFrequency[k][p]++
 		}
 	}
 
-	i.documents[docId] = IndexedDocument{Source: d.Source()}
-	i.documents[docId].Source["id"] = docId
+	doc := IndexedDocument{Source: d.Source(), Id: docId, TermFrequency: termFrequency}
+	i.documents[docId] = doc
 	i.NumDocs++
 
 	return nil
@@ -196,36 +239,36 @@ func (i *InvertedIndex) BulkIndex(docs []document.Document) error {
 }
 
 // Get is a function that returns the source of a single document in the index.
-func (i *InvertedIndex) Get(docId int64) (map[string]interface{}, error) {
+func (i *InvertedIndex) Get(docId int64) (IndexedDocument, error) {
 	if v, ok := i.documents[docId]; ok {
-		return v.Source, nil
+		return v, nil
 	} else if v, ok := i.cachedDocuments[docId]; ok {
-		return v.Source, nil
+		return v, nil
 	} else {
 		// Try to read all the dumped files, searching for the doc
 		for _, docFile := range i.DocumentFiles {
 			if docId <= docFile {
 				data, err := ioutil.ReadFile(i.createDumpDocsName(docFile))
 				if err != nil {
-					return make(map[string]interface{}), err
+					return IndexedDocument{}, err
 				}
 
 				dec := gob.NewDecoder(bytes.NewReader(data))
 				var indexedDocs map[int64]IndexedDocument
 				err = dec.Decode(&indexedDocs)
 				if err != nil {
-					return make(map[string]interface{}), err
+					return IndexedDocument{}, err
 				}
 
 				if v, ok := indexedDocs[docId]; ok {
 					i.cachedDocuments = indexedDocs
-					return v.Source, nil
+					return v, nil
 				}
 			}
 		}
 	}
 
-	return make(map[string]interface{}), errors.New(fmt.Sprintf("Document with id %v does not exist.", docId))
+	return IndexedDocument{}, errors.New(fmt.Sprintf("Document with id %v does not exist.", docId))
 }
 
 func (i *InvertedIndex) GetSources(docIds int64arr) ([]IndexedDocument, error) {
@@ -236,7 +279,7 @@ func (i *InvertedIndex) GetSources(docIds int64arr) ([]IndexedDocument, error) {
 		if err != nil {
 			return make([]IndexedDocument, 0), err
 		}
-		docs[j] = IndexedDocument{Source: d}
+		docs[j] = d
 	}
 	return docs, nil
 }

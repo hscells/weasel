@@ -87,7 +87,7 @@ func (b *BooleanQuery) Query(i index.InvertedIndex) ([]int64, error) {
 	// First, get the docIds that correspond to each query term
 	docIds := make([][]int64, len(b.QueryTerms))
 	for j, t := range b.QueryTerms {
-		docIds[j] = i.InvertedIndex[b.Field][i.TermMapping[t]]
+		docIds[j] = i.Posting[b.Field][i.TermMapping[t]]
 	}
 
 	// Secondly, filter based on operator
