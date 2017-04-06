@@ -126,11 +126,11 @@ func extractTerms(value interface{}) []string {
 		var token string
 
 		for _, char := range v {
-			if !unicode.IsPunct(char) && !unicode.IsControl(char) && !unicode.IsSpace(char) {
-				token += string(unicode.ToLower(char))
-			} else if unicode.IsSpace(char) {
+			if unicode.IsSpace(char) || unicode.IsPunct(char) || unicode.IsControl(char) {
 				tokens = append(tokens, token)
 				token = ""
+			} else if unicode.IsGraphic(char) {
+				token += string(unicode.ToLower(char))
 			}
 		}
 		return tokens
