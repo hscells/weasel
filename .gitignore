@@ -1,3 +1,10 @@
 weasel
 .idea/
 *.iml
+*.zip
+
+*.weasel
+*.wdocs
+*.xml
+*.md5
+
