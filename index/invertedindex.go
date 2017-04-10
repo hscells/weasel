@@ -18,15 +18,15 @@ import (
 	"unicode"
 )
 
-type int64arr []int64
+type Int64Arr []int64
 
-func (a int64arr) Len() int {
+func (a Int64Arr) Len() int {
 	return len(a)
 }
-func (a int64arr) Swap(i, j int) {
+func (a Int64Arr) Swap(i, j int) {
 	a[i], a[j] = a[j], a[i]
 }
-func (a int64arr) Less(i, j int) bool {
+func (a Int64Arr) Less(i, j int) bool {
 	return a[i] < a[j]
 }
 
@@ -271,7 +271,7 @@ func (i *InvertedIndex) Get(docId int64) (IndexedDocument, error) {
 	return IndexedDocument{}, errors.New(fmt.Sprintf("Document with id %v does not exist.", docId))
 }
 
-func (i *InvertedIndex) GetSources(docIds int64arr) ([]IndexedDocument, error) {
+func (i *InvertedIndex) GetSources(docIds Int64Arr) ([]IndexedDocument, error) {
 	sort.Sort(docIds)
 	docs := make([]IndexedDocument, len(docIds))
 	for j, k := range docIds {

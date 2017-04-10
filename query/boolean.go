@@ -2,6 +2,7 @@ package query
 
 import (
 	"github.com/hscells/weasel/index"
+	"sort"
 )
 
 type booleanOperator struct {
@@ -81,8 +82,8 @@ func distinct(vecs [][]int64) []int64 {
 }
 
 // Query is an implementation of a boolean query.
-func (b BooleanQuery) Query(i index.InvertedIndex) ([]int64, error) {
-	docs := make([]int64, 0)
+func (b BooleanQuery) Query(i index.InvertedIndex) (index.Int64Arr, error) {
+	docs := make(index.Int64Arr, 0)
 
 	// First, get the docIds that correspond to each query term
 	docIds := make([][]int64, len(b.QueryTerms))
@@ -138,5 +139,6 @@ func (b BooleanQuery) Query(i index.InvertedIndex) ([]int64, error) {
 		}
 	}
 
+	sort.Sort(docs)
 	return docs, nil
 }

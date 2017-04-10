@@ -10,7 +10,7 @@ type RetrievedDocument struct {
 }
 
 type Query interface {
-	Query(index.InvertedIndex) ([]int64, error)
+	Query(index.InvertedIndex) (index.Int64Arr, error)
 }
 
 func NewRetrievedDocument(source map[string]interface{}) RetrievedDocument {
