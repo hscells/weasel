@@ -9,7 +9,6 @@ import (
 
 // Document is a container for a document
 type Document struct {
-	id     interface{}
 	source map[string]interface{}
 }
 
@@ -24,11 +23,7 @@ func New() Document {
 func From(source map[string]interface{}) Document {
 	d := New()
 	for k, v := range source {
-		if k == "id" {
-			d.id = v
-		} else {
-			d.Set(k, v)
-		}
+		d.Set(k, v)
 	}
 	return d
 }
@@ -36,15 +31,6 @@ func From(source map[string]interface{}) Document {
 // Set adds fields and values to the document. Set is the only way new fields can be added to a document other than
 // creating one using From. This function will override existing values if they exist.
 func (d *Document) Set(field string, value interface{}) error {
-	// The id may be specified manually
-	if field == "id" {
-		if v, ok := value.(int64); ok {
-			d.id = v
-			return nil
-		}
-		return errors.New("Id value must be of type int64")
-	}
-
 	// Check the value is of a type that can be indexed
 	switch value.(type) {
 	case int64, int, float64, float32, time.Time, string:
@@ -57,10 +43,6 @@ func (d *Document) Set(field string, value interface{}) error {
 
 // Get a single field from the document
 func (d *Document) Get(field string) interface{} {
-	// The id may be specified manually
-	if field == "id" {
-		return d.id
-	}
 	return d.source[field]
 }
 

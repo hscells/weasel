@@ -81,7 +81,7 @@ func distinct(vecs [][]int64) []int64 {
 }
 
 // Query is an implementation of a boolean query.
-func (b *BooleanQuery) Query(i index.InvertedIndex) ([]int64, error) {
+func (b BooleanQuery) Query(i index.InvertedIndex) ([]int64, error) {
 	docs := make([]int64, 0)
 
 	// First, get the docIds that correspond to each query term

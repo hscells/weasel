@@ -3,7 +3,6 @@ package query
 
 import (
 	"github.com/hscells/weasel/index"
-	"github.com/hscells/weasel/document"
 )
 
 type RetrievedDocument struct {
@@ -11,7 +10,7 @@ type RetrievedDocument struct {
 }
 
 type Query interface {
-	Query(index.InvertedIndex) []document.Document
+	Query(index.InvertedIndex) ([]int64, error)
 }
 
 func NewRetrievedDocument(source map[string]interface{}) RetrievedDocument {

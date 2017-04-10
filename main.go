@@ -1,122 +1,68 @@
 package main
 
 import (
+	"os"
 	"github.com/hscells/weasel/index"
 	"log"
 	"github.com/hscells/weasel/document"
-	"github.com/hscells/weasel/query"
-	"reflect"
-	"path/filepath"
-	"os"
-	"strings"
-	"encoding/xml"
+	"bufio"
+	"fmt"
+	"encoding/json"
+	"bytes"
+	"github.com/hscells/weasel/api"
 )
 
 func main() {
-	mapping := make(map[string]reflect.Kind)
-	mapping["abstract"] = reflect.String
+	args := os.Args[1:]
 
-	invertedIndex := index.New("med_test3", mapping)
+	indexName := args[0]
 
-	fileList := []string{}
+	fmt.Println("Loading index...")
 
-	err := filepath.Walk("citations5", func(path string, f os.FileInfo, err error) error {
-		fileList = append(fileList, path)
-		return nil
-	})
+	// Load the index from disk
+	i, err := index.Load(indexName)
+	if err != nil {
+		log.Panicln(err)
+	}
 
-	for _, file := range fileList {
-		if strings.Contains(file, ".xml") && !strings.Contains(file, ".gz") {
-			var docs []document.Document
+	fmt.Println("Ready!")
 
-			log.Println(file)
-			f, err := os.Open(file)
-			if err != nil {
-				log.Panicln(err)
-			}
-			decoder := xml.NewDecoder(f)
+	reader := bufio.NewReader(os.Stdin)
 
-			log.Println("parsing xml...")
-			for {
-				t, _ := decoder.Token()
-				if t == nil {
-					break
-				}
+	for true {
 
-				switch se := t.(type) {
-				case xml.StartElement:
-					if se.Name.Local == "AbstractText" {
-						var text string
-						err := decoder.DecodeElement(&text, &se)
-						if err != nil {
-							log.Panicln(err)
-						}
-						d := document.New()
-						d.Set("abstract", text)
-						docs = append(docs, d)
-					}
-				}
-			}
+		fmt.Print("> ")
+		queryText, _ := reader.ReadString('\n')
 
-			log.Printf("indexing %v\n", file)
-			err = invertedIndex.BulkIndex(docs)
-			if err != nil {
-				log.Panicln(err)
-			}
+		b := bytes.NewBufferString(queryText)
+
+		// Construct a boolean query
+		var w api.BooleanQueryWrapper
+		json.Unmarshal(b.Bytes(), &w)
+
+		q := w.Convert()
+
+		// Query the index to retrieve documents
+		docs, err := q.Query(i)
+		if err != nil {
+			log.Panicln(err)
 		}
-	}
 
-	err = invertedIndex.Dump()
-	if err != nil {
-		log.Panicln(err)
-	}
+		// Print the id and body of each document retrieved
+		for j := 0; j < 10; j++ {
+			if j < len(docs) {
+				doc, _ := i.Get(docs[j])
+				source := document.From(doc.Source)
+				fmt.Printf("%v\n----\n", source)
+			}
 
-	err = invertedIndex.DumpDocs()
-	if err != nil {
-		log.Panicln(err)
-	}
+		}
 
-	log.Println("Loading index!")
-
-	i, err := index.Load("med_test3.weasel")
-	if err != nil {
-		log.Panicln(err)
-	}
-
-	log.Println("Loaded index!")
-	log.Printf("%v documents in the index", i.NumDocs)
-	log.Printf("%v terms in the index", len(i.TermMapping))
-
-	q := query.BooleanQuery{
-		Operator: query.And,
-		QueryTerms: []string{"human", "babies"},
-		Field: "abstract",
-	}
-
-	log.Println("Start querying!")
-
-	docs, err := q.Query(i)
-	if err != nil {
-		log.Panicln(err)
-	}
-
-	log.Println("Finished querying!")
-
-	log.Printf("%v docs retrieved\n", len(docs))
-
-	log.Println("Getting sources")
-
-	sources, err := i.GetSources(docs)
-	if err != nil {
-		log.Panicln(err)
-	}
-
-	log.Println("Got sources!")
-
-	for _, doc := range sources {
-		source := document.From(doc.Source)
-		log.Println(doc.Id)
-		log.Printf("%v", source.Get("abstract"))
+		if len(docs) == 0 {
+			fmt.Println("0 Results.")
+		} else {
+			fmt.Printf("%v Results.\n", len(docs))
+		}
 	}
 }
 
