@@ -23,12 +23,12 @@ if err != nil {
     log.Panicln(err)
 }
 // Dump the index to disk
-err = invertedIndex.Dump()
+err = i.Dump()
 if err != nil {
     log.Panicln(err)
 }
 // Dump the documents to disk
-err = invertedIndex.DumpDocs()
+err = i.DumpDocs()
 if err != nil {
     log.Panicln(err)
 }
