@@ -8,3 +8,5 @@ weasel
 *.xml
 *.md5
 
+wquery
+windex
