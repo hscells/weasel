@@ -14,10 +14,10 @@ import (
 	"reflect"
 	"unicode"
 	"path"
-	"github.com/hashicorp/golang-lru"
 	"os"
 	"encoding/binary"
-	"github.com/dgraph-io/badger"
+	"github.com/hashicorp/golang-lru"
+	"sync"
 )
 
 var (
@@ -44,6 +44,13 @@ type TermID uint32
 type DocumentID uint32
 
 type DocumentIDs []DocumentID
+
+type postingItem struct {
+	DocumentID
+	TermID
+	Term  string
+	Field string
+}
 
 // IndexedDocument is a document that gets returned if the index is asked for a document
 type IndexedDocument struct {
@@ -96,10 +103,10 @@ type InvertedIndex struct {
 	// Posting is a map of term ID to document ID.
 	// field->termID->docID
 	// map[string]map[TermID][]DocumentID
-	posting *badger.DB
+	posting Posting
 
-	// cache is a cache of postings.
-	cache map[string]*lru.ARCCache
+	postingChan  chan postingItem
+	postingCache *lru.Cache
 
 	// Persistent disk.
 	disk *diskv.Diskv
@@ -126,14 +133,6 @@ func NewInvertedIndex(name string, mapping map[string]Indexable, options ...func
 		os.Mkdir(name, 0777)
 	}
 
-	opts := badger.DefaultOptions
-	opts.Dir = path.Join(name, "posting")
-	opts.ValueDir = path.Join(name, "posting")
-	db, err := badger.Open(opts)
-	if err != nil {
-		panic(err)
-	}
-
 	// Simplest transform function: put all the data files into the base dir.
 	i := &InvertedIndex{
 		Name:            name,
@@ -142,10 +141,9 @@ func NewInvertedIndex(name string, mapping map[string]Indexable, options ...func
 		ContainsSource:  make(map[string]bool),
 		DocumentMapping: make(map[DocumentID]string),
 		Analysers:       make(map[string][]Analyser),
-		posting:         db,
-		cache:           make(map[string]*lru.ARCCache),
 		disk: diskv.New(diskv.Options{
-			BasePath:     path.Join(name, "index"),
+			BasePath: path.Join(name, "index"),
+			//TempDir:      path.Join(name, "index_tmp"),
 			Transform:    blockTransform(3),
 			CacheSizeMax: 4096 * 1024,
 			Compression:  diskv.NewGzipCompression(),
@@ -153,14 +151,17 @@ func NewInvertedIndex(name string, mapping map[string]Indexable, options ...func
 	}
 
 	// By default store the sources of all fields.
+	var fields []string
 	for field := range mapping {
 		i.ContainsSource[field] = true
-
-		i.cache[field], err = lru.NewARC(4096 * 1024)
-		if err != nil {
-			panic(err)
-		}
+		fields = append(fields, field)
 	}
+
+	p, err := NewPosting(name, fields...)
+	if err != nil {
+		panic(err)
+	}
+	i.posting = p
 
 	// Apply optional functions to the index.
 	for _, option := range options {
@@ -178,8 +179,14 @@ func isMn(r rune) bool {
 func (t TermID) toBytes(field string) []byte {
 	b := make([]byte, 4)
 	binary.LittleEndian.PutUint32(b, uint32(t))
-	b = append(b, []byte(field)...)
-	return b
+	return append([]byte(field), b...)
+}
+
+func bytesToString(data []byte) (s string) {
+	for _, d := range data {
+		s += fmt.Sprintf("%d", d)
+	}
+	return
 }
 
 func (ids DocumentIDs) toBytes() []byte {
@@ -235,28 +242,36 @@ func tokenise(value interface{}) []string {
 }
 
 func (index InvertedIndex) DocumentIDs(field, term string) (ids []DocumentID) {
-	if _, ok := index.TermStatistics[term]; !ok {
+	var termID TermID
+	if t, ok := index.TermStatistics[term]; ok {
+		termID = t.ID
+	} else {
 		return
 	}
 
-	termID := index.TermStatistics[term].ID
-	index.posting.View(func(txn *badger.Txn) error {
-		item, err := txn.Get(termID.toBytes(field))
-		if err != nil {
-			return err
-		}
-		v, err := item.Value()
-		if err != nil {
-			return err
-		}
-		if len(v) == 0 {
-			return nil
-		}
-		ids = documentIDsFromBytes(v)
-		return nil
-	})
-	return
+	v, err := index.posting.Read(field, termID)
+	if err != nil {
+		return
+	}
+
+	if v == nil {
+		return
+	}
+
+	return documentIDsFromBytes(v)
 }
+
+func (index *InvertedIndex) BulkIndex(docs []Document) error {
+	for _, doc := range docs {
+		err := index.Index(doc)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+var mu = sync.Mutex{}
 
 // Index takes a document and adds it to the inverted index. It also stores the document source, plus statistics
 func (index *InvertedIndex) Index(d Document) error {
@@ -270,10 +285,8 @@ func (index *InvertedIndex) Index(d Document) error {
 
 	t := transform.Chain(norm.NFD, runes.Remove(runes.Predicate(isMn)), norm.NFC)
 
+	index.NumDocs++
 	docID := index.NumDocs
-
-	txn := index.posting.NewTransaction(true)
-	defer txn.Discard()
 
 	// check the types of the mapping match that of the source
 	for field, source := range d.source {
@@ -302,7 +315,6 @@ func (index *InvertedIndex) Index(d Document) error {
 
 		// Add new terms to the term mapping
 		terms := tokenise(source)
-		distinctTerms := make(map[TermID]bool)
 		for i, term := range terms {
 
 			if len(term) == 0 {
@@ -328,15 +340,36 @@ func (index *InvertedIndex) Index(d Document) error {
 				index.TermStatistics[term] = stats
 			}
 
+			index.DocumentMapping[DocumentID(docID)] = d.ID
 			termID := index.TermStatistics[term].ID
+
+			if _, ok := positions[field][termID]; !ok {
+				go func() {
+					var storedDocIDs DocumentIDs
+					v, err := index.posting.Read(field, termID)
+					if err != nil {
+						storedDocIDs = []DocumentID{}
+					} else if v == nil {
+						storedDocIDs = []DocumentID{}
+					} else {
+						storedDocIDs = documentIDsFromBytes(v)
+					}
+					docIDs := append(storedDocIDs, DocumentID(docID))
+					//fmt.Println(termID, term, field, docIDs)
+
+					err = index.posting.Write(field, termID, docIDs.toBytes())
+					if err != nil {
+						panic(err)
+					}
+				}()
+			}
 
 			// Recalculate term frequency
 			if _, ok := index.TermStatistics[term]; ok {
 				tmp := index.TermStatistics[term]
 				tmp.TotalTermFrequency++
-				if _, ok := distinctTerms[termID]; !ok {
+				if _, ok := positions[field][termID]; !ok {
 					tmp.DocumentFrequency++
-					distinctTerms[termID] = true
 				}
 				index.TermStatistics[term] = tmp
 			} else {
@@ -346,37 +379,6 @@ func (index *InvertedIndex) Index(d Document) error {
 					DocumentFrequency:  1,
 				}
 			}
-
-			// Add the document to the inverted index.
-			if len(positions[field][termID]) == 0 {
-				var storedDocIDs []DocumentID
-
-				//if docs, ok := index.cache[field].Get(termID); ok {
-				//	storedDocIDs = docs.([]DocumentID)
-				//} else {
-				item, err := txn.Get(termID.toBytes(field))
-				if err == badger.ErrKeyNotFound {
-					storedDocIDs = []DocumentID{}
-				} else if err != nil {
-					return err
-				} else {
-					v, err := item.Value()
-					if err != nil {
-						return err
-					}
-					storedDocIDs = documentIDsFromBytes(v)
-				}
-				//}
-
-				docIDs := append(storedDocIDs, DocumentID(docID))
-
-				txn.Set(termID.toBytes(field), DocumentIDs(docIDs).toBytes())
-
-				//index.cache[field].Add(termID, docIDs)
-
-				index.DocumentMapping[DocumentID(docID)] = d.ID
-			}
-
 			termFrequency[field][termID]++
 			positions[field][termID] = append(positions[term][termID], int32(i))
 		}
@@ -386,20 +388,17 @@ func (index *InvertedIndex) Index(d Document) error {
 		}
 	}
 
-	// Commit the transaction and check for error.
-	if err := txn.Commit(nil); err != nil {
-		return err
-	}
-
 	indexedDocument := IndexedDocument{Source: d.source, ID: d.ID, TermFrequency: termFrequency, Positions: positions}
-	index.NumDocs++
 
 	go func() {
 		b, err := indexedDocument.toBytes()
 		if err != nil {
 			panic(err)
 		}
-		index.disk.Write(indexedDocument.ID, b)
+		err = index.disk.Write(indexedDocument.ID, b)
+		if err != nil {
+			panic(err)
+		}
 	}()
 
 	return nil
@@ -453,24 +452,19 @@ func LoadIndex(store string) (InvertedIndex, error) {
 		return InvertedIndex{}, err
 	}
 
-	opts := badger.DefaultOptions
-	opts.Dir = path.Join(store, "posting")
-	opts.ValueDir = path.Join(store, "posting")
-	i.posting, err = badger.Open(opts)
+	var fields []string
+	for field := range i.FieldMapping {
+		fields = append(fields, field)
+	}
+	p, err := NewPosting(store, fields...)
 	if err != nil {
 		panic(err)
 	}
-
-	i.cache = make(map[string]*lru.ARCCache)
-	for field := range i.FieldMapping {
-		i.cache[field], err = lru.NewARC(10000)
-		if err != nil {
-			return InvertedIndex{}, err
-		}
-	}
+	i.posting = p
 
 	i.disk = diskv.New(diskv.Options{
-		BasePath:     path.Join(store, "index"),
+		BasePath: path.Join(store, "index"),
+		//TempDir:      path.Join(store, "index_tmp"),
 		Transform:    blockTransform(3),
 		CacheSizeMax: 4096 * 1024,
 		Compression:  diskv.NewGzipCompression(),
