@@ -9,12 +9,13 @@ import (
 	"github.com/hscells/transmute/pipeline"
 	"github.com/hscells/weasel"
 	"log"
+	"fmt"
+	"time"
 )
 
 type args struct {
-	IndexFile  string `arg:"help:path to weasel index file.,required"`
-	IndexStore string `arg:"help:path to weasel index store.,required"`
-	Query      string `arg:"help:query to issue to weasel index."`
+	Index string `arg:"help:path to weasel index store.,required"`
+	Query string `arg:"help:query to issue to weasel index."`
 }
 
 func (args) Version() string {
@@ -29,11 +30,6 @@ func main() {
 
 	var args args
 	arg.MustParse(&args)
-
-	wi, err := weasel.LoadIndex(args.IndexFile, args.IndexStore)
-	if err != nil {
-		log.Fatal(err)
-	}
 
 	p := pipeline.NewPipeline(parser.NewCQRParser(),
 		backend.NewCQRBackend(),
@@ -54,13 +50,45 @@ func main() {
 		log.Fatal(err)
 	}
 
-	seen := make(map[uint64]weasel.LogicalTreeNode)
-	tree, _, err := wi.Execute(repr.(cqr.CommonQueryRepresentation), seen)
+	fmt.Println(repr)
+
+	log.Println("parsed query")
+
+	wi, err := weasel.LoadIndex(args.Index)
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 
-	log.Println("Documents")
-	log.Println(len(tree.Documents()))
+	log.Println("loaded index")
 
+	start := time.Now()
+	tree, _, err := wi.Execute(repr.(cqr.CommonQueryRepresentation))
+	if err != nil {
+		panic(err)
+	}
+
+	log.Println("executed query")
+
+	docs, err := tree.Documents()
+	if err != nil {
+		panic(err)
+	}
+
+	elapsed := time.Since(start)
+
+	log.Printf("retrieved %v documents in %v seconds", len(docs), elapsed.Seconds())
+
+	max := 10
+	for i, docID := range docs {
+		doc, err := wi.Get(docID)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Printf("[%v] - %v\n", doc.ID, doc.Source["title"])
+		if i > max {
+			break
+		}
+	}
+
+	log.Println("done")
 }
